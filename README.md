@@ -36,6 +36,7 @@ Isso permite aprovar as mensagens de forma mais rápida, dentro de um intervalo 
 ## Contribuições
 
 Sinta-se à vontade para contribuir com melhorias ou novas funcionalidades para o projeto. Abra um PR ou reporte problemas na aba de issues.
+Ou enviar Sats para `verdantkite75@walletofsatoshi.com` para apoiar o desenvolvimento.
 
 ---
 
