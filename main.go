@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/goccy/go-json"
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip13"
 	"github.com/nbd-wtf/go-nostr/nip19"
+	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -23,21 +25,27 @@ type Keys struct {
 }
 
 func (k *Keys) DecodedPub() string {
-	_, v, _ := nip19.Decode(k.pub)
+	_, v, err := nip19.Decode(k.pub)
+	if err != nil {
+		log.Fatal(err)
+	}
 	return v.(string)
 }
 func (k *Keys) DecodedPrv() string {
-	_, v, _ := nip19.Decode(k.prv)
+	_, v, err := nip19.Decode(k.prv)
+	if err != nil {
+		log.Fatal(err)
+	}
 	return v.(string)
 }
 
 type Connection struct {
 	Context      context.Context
 	Relay        *nostr.Relay
-	CreatedList  []nostr.Event
-	ApprovedList []nostr.Event
-	ToApproval   []nostr.Event
-	ToApproved   []nostr.Event
+	CreatedList  []*nostr.Event // Events created in the community
+	ApprovedList []*nostr.Event // Events approved in the community
+	ToApproval   []*nostr.Event // Events to be approved
+	ToPublish    []*nostr.Event // Events to be published
 	ErrorList    []error
 	Wg           sync.WaitGroup
 	sync.Mutex
@@ -51,22 +59,18 @@ func NewConnection(ctx context.Context, relayURL string) (*Connection, error) {
 
 	return &Connection{
 		Relay:        relay,
-		CreatedList:  []nostr.Event{},
-		ApprovedList: []nostr.Event{},
-		ToApproval:   []nostr.Event{},
-		ToApproved:   []nostr.Event{},
+		CreatedList:  []*nostr.Event{},
+		ApprovedList: []*nostr.Event{},
+		ToApproval:   []*nostr.Event{},
+		ToPublish:    []*nostr.Event{},
 		ErrorList:    []error{},
 		Context:      ctx,
 	}, nil
 }
 
-func (conn *Connection) SubscribeToFilter(filter nostr.Filter, eventList *[]nostr.Event, timeout time.Duration) {
+func (conn *Connection) SubscribeToFilter(filter nostr.Filter, eventList *[]*nostr.Event, timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(conn.Context, timeout)
-
-	defer func() {
-		cancel()
-		conn.Wg.Done()
-	}()
+	defer cancel()
 
 	sub, err := conn.Relay.Subscribe(ctx, nostr.Filters{filter})
 	if err != nil {
@@ -77,44 +81,59 @@ func (conn *Connection) SubscribeToFilter(filter nostr.Filter, eventList *[]nost
 	}
 
 	for ev := range sub.Events {
-		fmt.Println(ev)
+
 		conn.Lock()
-		*eventList = append(*eventList, *ev)
+		*eventList = append(*eventList, ev)
+		fmt.Println(ev)
 		conn.Unlock()
 	}
+	conn.Wg.Done()
 }
 
-func (conn *Connection) CreateApprovalEvents(keys *Keys, community *Community) {
-	var toApproved []nostr.Event
+func (conn *Connection) CreateApprovalEvents(keys *Keys, community *Community, pow uint) {
+	var toPublish []*nostr.Event
 
 	for _, event := range conn.ToApproval {
 		j, _ := json.Marshal(event)
+		t := nostr.Tags{
+			nostr.Tag{"a", fmt.Sprintf("%d:%s:%s", nostr.KindCommunityDefinition, community.Id, community.Name)},
+			nostr.Tag{"e", event.ID},
+			nostr.Tag{"p", event.PubKey},
+			nostr.Tag{"k", strconv.Itoa(event.Kind)},
+		}
+
 		ev := nostr.Event{
-			PubKey: keys.DecodedPub(),
-			Kind:   nostr.KindCommunityPostApproval,
-			Tags: nostr.Tags{
-				nostr.Tag{"a", fmt.Sprintf("%d:%s:%s", nostr.KindCommunityDefinition, community.Id, community.Name)},
-				nostr.Tag{"e", event.ID},
-				nostr.Tag{"p", event.PubKey},
-				nostr.Tag{"k", strconv.Itoa(event.Kind)},
-			},
+			PubKey:    keys.DecodedPub(),
+			Kind:      nostr.KindCommunityPostApproval,
+			Tags:      t,
 			Content:   string(j),
 			CreatedAt: nostr.Now(),
 		}
+
+		if pow > 0 {
+			// DoWork() performs work in multiple threads (given by runtime.NumCPU()) and returns the first
+			tWork, err := nip13.DoWork(conn.Context, ev, int(pow))
+			if err != nil {
+				conn.ErrorList = append(conn.ErrorList, err)
+				continue
+			}
+			ev.Tags = append(ev.Tags, tWork)
+		}
+
 		if err := ev.Sign(keys.DecodedPrv()); err == nil {
-			toApproved = append(toApproved, ev)
+			toPublish = append(toPublish, &ev)
 		} else {
 			conn.ErrorList = append(conn.ErrorList, err)
 		}
 	}
 
-	conn.ToApproved = toApproved
+	conn.ToPublish = toPublish
 }
 
 func (conn *Connection) PublishEvents() {
-	for _, ev := range conn.ToApproved {
+	for _, ev := range conn.ToPublish {
 		time.Sleep(300 * time.Millisecond)
-		if err := conn.Relay.Publish(conn.Context, ev); err != nil {
+		if err := conn.Relay.Publish(conn.Context, *ev); err != nil {
 			conn.ErrorList = append(conn.ErrorList, err)
 		}
 	}
@@ -127,6 +146,7 @@ func main() {
 	fPubKey := flag.String("pub-key", "", "Public Key")
 	fPrvKey := flag.String("prv-key", "", "Private Key")
 	fSinceTime := flag.Int64("since-time", 24, "Since Time (Hours)")
+	fPow := flag.Uint("pow", 0, "Proof of Work")
 
 	flag.Parse()
 
@@ -186,14 +206,14 @@ func main() {
 		}
 	}
 
-	conn.CreateApprovalEvents(keys, community)
+	conn.CreateApprovalEvents(keys, community, *fPow)
 
 	conn.PublishEvents()
 
 	fmt.Printf("Criados: %d\n", len(conn.CreatedList))
 	fmt.Printf("Aprovados: %d\n", len(conn.ApprovedList))
 	fmt.Printf("Para aprovar: %d\n", len(conn.ToApproval))
-	fmt.Printf("Novos Aprovados: %d\n", len(conn.ToApproved))
+	fmt.Printf("Novos Aprovados: %d\n", len(conn.ToPublish))
 	fmt.Printf("Erros: %d\n", len(conn.ErrorList))
 
 	for _, err := range conn.ErrorList {

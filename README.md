@@ -20,6 +20,7 @@ nostr-approval -cid <ID> -cname <NAME> -pub-key <PUBKEY> -prv-key <PRVKEY>
 - `-prv-key`: **Obrigatório**. Chave privada.
 - `-relay`: **Opcional**. Endereço do servidor de retransmissão.
 - `-since-time`: **Opcional**. Define o intervalo de tempo (em horas) para busca de postagens.
+- `-pow`: **Opcional**. Define o nível de dificuldade do PoW.
 
 ## Recomendações
 
